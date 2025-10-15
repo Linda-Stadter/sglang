@@ -21,6 +21,18 @@ def fast_topk_v2(score: torch.Tensor, lengths: torch.Tensor, topk: int) -> torch
     return topk_indices
 
 
+def vllm_fast_topk_v2(
+    score: torch.Tensor, lengths: torch.Tensor, topk: int
+) -> torch.Tensor:
+    assert (
+        topk == 2048
+    ), "alternative_fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert score.dim() == 2
+    topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
+    torch.ops.sgl_kernel.vllm_fast_topk(score, topk_indices, lengths)
+    return topk_indices
+
+
 def fast_topk_transform_fused(
     score: torch.Tensor,
     lengths: torch.Tensor,

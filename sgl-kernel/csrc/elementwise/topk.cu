@@ -16,12 +16,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <optional>
 
 namespace {
 
 constexpr int TopK = 2048;
 constexpr int kThreadsPerBlock = 1024;
+constexpr int kThreadsPerBlockVllm = 512;
 constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t);  // 128KB
 
 struct FastTopKParams {
@@ -61,6 +64,16 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+static inline __device__ uint16_t extractBinIdx(float x) {
+  union {
+    __half h;
+    uint16_t u16;
+  } tmp;
+  tmp.h = __float2half_rn(x);
+  tmp.u16 = (x < 0.f) ? (~tmp.u16 & 0xffff) : (tmp.u16 | 0x8000);
+  return 511 - (tmp.u16 >> 7);
 }
 
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int length) {
@@ -227,6 +240,561 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   }
 }
 
+// Follows 11 - 11 - 10 bit iterations
+template <int kNumThreadsPerBlock = 512>
+static __device__ void topKPerRowOptimized(const float* logits, int* outIndices, int length) {
+  // The number of bins in the histogram.
+  static constexpr int kNumBins = 2048;
+
+  static constexpr int kNumBinsPerThread = kNumBins / kNumThreadsPerBlock;
+  // The top-k width.
+  static constexpr int kTopK = 2048;
+  // The number of elements per thread for the final top-k sort.
+  static constexpr int kNumTopKItemsPerThread = kTopK / kNumThreadsPerBlock;
+
+  // The number of slots for the final pass.
+  static constexpr int kNumFinalItems = 2048;
+  // The number of elements per thread for the final sort.
+  static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+  // The class to sort the elements during the final pass.
+  using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
+
+  // The class to compute the inclusive prefix-sum over the histogram.
+  using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+
+  // Shared memory to compute the block scan.
+  __shared__ typename Scan::TempStorage smemScan;
+
+  // The structure to store the final items (for the final pass).
+  struct FinalItems {
+    // Shared memory to store the indices for the final pass.
+    int indices[kNumFinalItems];
+    // Shared memory to store the logits for the final pass.
+    float logits[kNumFinalItems];
+  };
+
+  // Shared memory to compute the block sort.
+  __shared__ union {
+    FinalItems items;
+    typename FinalSort::TempStorage finalSort;
+    // typename TopKSort::TempStorage topKSort;
+  } smemFinal;
+
+  // Shared memory to store the histogram.
+  __shared__ int smemHistogram[kNumBins];
+  // Shared memory to store the selected indices.
+  __shared__ int smemIndices[kTopK];
+  // Shared memory to store the threshold bin.
+  __shared__ int smemThresholdBinIdx[1];
+  // Shared memory counter to register the candidates for the final phase.
+  __shared__ int smemFinalDstIdx[1];
+  // Shared memory to determine if the threshold bin fits in the final items.
+  __shared__ int smemFinalBinSize[1];
+  // Shared memory to keep track of the top-k values found so far by the previous iterations
+  __shared__ int smemFoundTopKValues[1];
+
+  // Shortcut if the length of the row is smaller than Top-K. Indices are not
+  // sorted by their corresponding logit.
+  if (length <= kTopK) {
+    for (int rowIt = threadIdx.x; rowIt < length; rowIt += kNumThreadsPerBlock) {
+      outIndices[rowIt] = rowIt;
+    }
+    for (int rowIt = length + threadIdx.x; rowIt < kTopK; rowIt += kNumThreadsPerBlock) {
+      outIndices[rowIt] = -1;
+    }
+    return;
+  }
+
+  // Clear the histogram.
+#pragma unroll
+  for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
+    smemHistogram[idx] = 0;
+  }
+
+  // Make sure the histogram is ready.
+  __syncthreads();
+
+  // Fetch elements one-by-one.
+  for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+    uint32_t binIdx = convert_to_uint32(logits[idx]);
+    binIdx = 2047 - (binIdx >> 21);  // Take first 11 bits
+    atomicAdd(&smemHistogram[binIdx], 1);
+  }
+  // Initialize values
+  if (threadIdx.x == 0) {
+    smemFinalDstIdx[0] = 0;
+    smemFoundTopKValues[0] = 0;
+  }
+
+  // Make sure the histogram is ready.
+  __syncthreads();
+  const auto exclusiveScan = [&] {
+    // Reads the value of the starting position in the smemIndices array
+    int lastValue = smemFoundTopKValues[0];
+
+    for (int round = 0; round < kNumBinsPerThread; round++) {
+      // Read the values from SMEM.
+      int idx = threadIdx.x + kNumThreadsPerBlock * round;
+      int binCount{0};
+      binCount = smemHistogram[idx];
+
+      // Make sure each thread has read its value.
+      __syncthreads();
+
+      // Compute the prefix sum.
+      int prefixSum{0}, totalSum{0};
+      Scan(smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+      // Update the histogram with the prefix sums.
+      smemHistogram[idx] = prefixSum + lastValue;
+
+      // Make sure the data is in shared memory.
+      __syncthreads();
+
+      // Find the last valid bin.
+      bool foundThreshold = false;
+      if (prefixSum + lastValue < kTopK) {
+        int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1 ? totalSum + lastValue : smemHistogram[idx + 1];
+
+        if (nextPrefixSum >= kTopK) {
+          smemThresholdBinIdx[0] = idx;
+          smemFinalBinSize[0] = nextPrefixSum - prefixSum - lastValue;
+          smemFoundTopKValues[0] = prefixSum + lastValue;
+          foundThreshold = true;
+        }
+      }
+
+      // Early exit: if any thread found the threshold, we can skip remaining rounds
+      if (__syncthreads_or(foundThreshold)) {
+        break;
+      }
+
+      lastValue = totalSum + lastValue;
+    }
+  };
+
+  exclusiveScan();
+
+  // Make sure the data is in shared memory.
+  __syncthreads();
+
+  // The threshold bin.
+  int thresholdBinIdx = smemThresholdBinIdx[0];
+
+  // Iteration 1: Start with the first 11 bits
+  // Fetch elements one-by-one and populate the shared memory buffers.
+  for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+    float logit = logits[idx];
+    uint32_t binIdx = convert_to_uint32(logits[idx]);
+    binIdx = 2047 - (binIdx >> 21);
+
+    if (binIdx < thresholdBinIdx) {
+      int dstIdx = atomicAdd(&smemHistogram[binIdx], 1);
+      smemIndices[dstIdx] = idx;
+    } else if (binIdx == thresholdBinIdx) {
+      // Only fill the final items if the threshold bin fits
+      if (smemFinalBinSize[0] <= kNumFinalItems) {
+        int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+        smemFinal.items.logits[dstIdx] = logit;
+        smemFinal.items.indices[dstIdx] = idx;
+      }
+    }
+  }
+
+  // Make sure the elements are in shared memory.
+  __syncthreads();
+
+  const auto sortFinalItems = [&] {
+    // The logits of the elements to be sorted in the final pass.
+    float finalLogits[kNumFinalItemsPerThread];
+    // The indices of the elements to be sorted in the final pass.
+    int finalIndices[kNumFinalItemsPerThread];
+
+#pragma unroll
+    for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+      finalLogits[ii] = -FLT_MAX;
+    }
+
+// Read the elements from SMEM.
+#pragma unroll
+    for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+      int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+      if (srcIdx < smemFinalDstIdx[0]) {
+        finalLogits[ii] = smemFinal.items.logits[srcIdx];
+        finalIndices[ii] = smemFinal.items.indices[srcIdx];
+      }
+    }
+
+    // Make sure the shared memory has been read.
+    __syncthreads();
+
+    // Sort the elements.
+    FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+    // Copy the data back to the shared memory storage.
+    int baseIdx = thresholdBinIdx > 0 ? smemHistogram[thresholdBinIdx - 1] : smemHistogram[0];
+
+#pragma unroll
+    for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+      int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+      int dstIdx = baseIdx + srcIdx;
+      if (dstIdx < kTopK) {
+        smemIndices[dstIdx] = finalIndices[ii];
+      }
+    }
+  };
+
+  if (smemFinalBinSize[0] <= kNumFinalItems) {
+    sortFinalItems();
+    // Make sure the data is in shared memory.
+    __syncthreads();
+  } else {
+    // Iteration 2: Continue with the next 11 bits
+    // Clear the histogram.
+#pragma unroll
+    for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
+      smemHistogram[idx] = 0;
+    }
+
+    // Make sure the histogram is ready.
+    __syncthreads();
+
+    // Fetch elements one-by-one.
+    // Only process elements that were in the Round 1 threshold bin
+    int it1ThresholdBinIdx = smemThresholdBinIdx[0];
+    for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+      uint32_t it1BinIdx = convert_to_uint32(logits[idx]);
+      it1BinIdx = 2047 - (it1BinIdx >> 21);
+
+      // Only process if this element was in the Round 1 threshold bin
+      if (it1BinIdx == it1ThresholdBinIdx) {
+        uint32_t binIdx = convert_to_uint32(logits[idx]);
+        binIdx = 2047 - ((binIdx >> 10) & 0x7FF);  // Take next 11 bits
+        atomicAdd(&smemHistogram[binIdx], 1);
+      }
+    }
+
+    // Make sure the histogram is ready.
+    __syncthreads();
+    exclusiveScan();
+    __syncthreads();
+
+    thresholdBinIdx = smemThresholdBinIdx[0];
+    // Fetch elements one-by-one and populate the shared memory buffers.
+    for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+      uint32_t it1BinIdx = convert_to_uint32(logits[idx]);
+      it1BinIdx = 2047 - (it1BinIdx >> 21);
+
+      // Only process if this element was in the Round 1 threshold bin
+      if (it1BinIdx == it1ThresholdBinIdx) {
+        float logit = logits[idx];
+        uint32_t binIdx = convert_to_uint32(logits[idx]);
+        binIdx = 2047 - ((binIdx >> 10) & 0x7FF);  // Take next 11 bits
+
+        if (binIdx < thresholdBinIdx) {
+          int dstIdx = atomicAdd(&smemHistogram[binIdx], 1);
+          smemIndices[dstIdx] = idx;
+        } else if (binIdx == thresholdBinIdx) {
+          // Only fill the final items if the threshold bin fits
+          if (smemFinalBinSize[0] <= kNumFinalItems) {
+            int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+            smemFinal.items.logits[dstIdx] = logit;
+            smemFinal.items.indices[dstIdx] = idx;
+          }
+        }
+      }
+    }
+
+    // Make sure the elements are in shared memory.
+    __syncthreads();
+
+    if (smemFinalBinSize[0] <= kNumFinalItems) {
+      sortFinalItems();
+      // Make sure the data is in shared memory.
+      __syncthreads();
+    } else {
+      // Iteration 3: Continue with the last 10 bits
+      // Clear the histogram.
+#pragma unroll
+      for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
+        smemHistogram[idx] = 0;
+      }
+
+      // Make sure the histogram is ready.
+      __syncthreads();
+
+      // Fetch elements one-by-one.
+      // Only process elements that were in both Round 1 AND Round 2 threshold bins
+      int it2ThresholdBinIdx = smemThresholdBinIdx[0];
+      for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+        uint32_t it1BinIdx = convert_to_uint32(logits[idx]);
+        it1BinIdx = 2047 - (it1BinIdx >> 21);
+
+        uint32_t it2BinIdx = convert_to_uint32(logits[idx]);
+        it2BinIdx = 2047 - ((it2BinIdx >> 10) & 0x7FF);
+
+        // Only process if this element was in both threshold bins
+        if (it1BinIdx == it1ThresholdBinIdx && it2BinIdx == it2ThresholdBinIdx) {
+          uint32_t binIdx = convert_to_uint32(logits[idx]);
+          binIdx = 1023 - (binIdx & 0x3FF);  // Take last 10 bits
+          atomicAdd(&smemHistogram[binIdx], 1);
+        }
+      }
+
+      // Make sure the histogram is ready.
+      __syncthreads();
+      exclusiveScan();
+      __syncthreads();
+
+      thresholdBinIdx = smemThresholdBinIdx[0];
+      // Fetch elements one-by-one and populate the shared memory buffers.
+      for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+        uint32_t it1BinIdx = convert_to_uint32(logits[idx]);
+        it1BinIdx = 2047 - (it1BinIdx >> 21);
+
+        uint32_t it2BinIdx = convert_to_uint32(logits[idx]);
+        it2BinIdx = 2047 - ((it2BinIdx >> 10) & 0x7FF);
+
+        // Only process if this element was in both threshold bins
+        if (it1BinIdx == it1ThresholdBinIdx && it2BinIdx == it2ThresholdBinIdx) {
+          float logit = logits[idx];
+          uint32_t binIdx = convert_to_uint32(logits[idx]);
+          binIdx = 1023 - (binIdx & 0x3FF);
+
+          if (binIdx < thresholdBinIdx) {
+            int dstIdx = atomicAdd(&smemHistogram[binIdx], 1);
+            smemIndices[dstIdx] = idx;
+          } else if (binIdx == thresholdBinIdx) {
+            int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+            if (dstIdx < kNumFinalItems) {
+              smemFinal.items.logits[dstIdx] = logit;
+              smemFinal.items.indices[dstIdx] = idx;
+            }
+          }
+        }
+      }
+      __syncthreads();
+
+      sortFinalItems();
+
+      __syncthreads();
+    }
+  }
+
+// Store to global memory.
+#pragma unroll
+  for (int ii = 0; ii < kNumTopKItemsPerThread; ++ii) {
+    int offset = ii * kNumThreadsPerBlock + threadIdx.x;
+    outIndices[offset] = smemIndices[offset];
+  }
+}
+
+// copied from vllm
+template <int kNumThreadsPerBlock = 512>
+static __device__ void topKPerRow(const float* logits, int* outIndices, int length) {
+  // The number of bins in the histogram.
+  static constexpr int kNumBins = 512;
+
+  // The top-k width.
+  static constexpr int kTopK = 2048;
+  // The number of elements per thread for the final top-k sort.
+  static constexpr int kNumTopKItemsPerThread = kTopK / kNumThreadsPerBlock;
+  // The class to sort the elements during the final top-k sort.
+  using TopKSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumTopKItemsPerThread, int>;
+
+  // The number of slots for the final pass.
+  static constexpr int kNumFinalItems = 3072;
+  // The number of elements per thread for the final sort.
+  static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+  // The class to sort the elements during the final pass.
+  using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
+
+  // The class to compute the inclusive prefix-sum over the histogram.
+  using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+
+  // Shared memory to compute the block scan.
+  __shared__ typename Scan::TempStorage smemScan;
+
+  // The structure to store the final items (for the final pass).
+  struct FinalItems {
+    // Shared memory to store the indices for the final pass.
+    int indices[kNumFinalItems];
+    // Shared memory to store the logits for the final pass.
+    float logits[kNumFinalItems];
+  };
+
+  // Shared memory to compute the block sort.
+  __shared__ union {
+    FinalItems items;
+    typename FinalSort::TempStorage finalSort;
+    typename TopKSort::TempStorage topKSort;
+  } smemFinal;
+
+  // Shared memory to store the histogram.
+  __shared__ int smemHistogram[kNumBins];
+  // Shared memory to store the selected indices.
+  __shared__ int smemIndices[kTopK];
+  // Shared memory to store the selected logits.
+  __shared__ float smemLogits[kTopK];
+  // Shared memory to store the threshold bin.
+  __shared__ int smemThresholdBinIdx[1];
+  // Shared memory counter to register the candidates for the final phase.
+  __shared__ int smemFinalDstIdx[1];
+
+  // Shortcut if the length of the row is smaller than Top-K. Indices are not
+  // sorted by their corresponding logit.
+  if (length <= kTopK) {
+    for (int rowIt = threadIdx.x; rowIt < length; rowIt += kNumThreadsPerBlock) {
+      outIndices[rowIt] = rowIt;
+    }
+    for (int rowIt = length + threadIdx.x; rowIt < kTopK; rowIt += kNumThreadsPerBlock) {
+      outIndices[rowIt] = -1;
+    }
+    return;
+  }
+
+  // Clear the histogram.
+  if (threadIdx.x < kNumBins) {
+    smemHistogram[threadIdx.x] = 0;
+  }
+
+  // Make sure the histogram is ready.
+  __syncthreads();
+
+  // Fetch elements one-by-one.
+  for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+    uint16_t binIdx = extractBinIdx(logits[idx]);
+    atomicAdd(&smemHistogram[binIdx], 1);
+  }
+
+  // Make sure the histogram is ready.
+  __syncthreads();
+
+  // Read the values from SMEM.
+  int binCount{0};
+  if (threadIdx.x < kNumBins) {
+    binCount = smemHistogram[threadIdx.x];
+  }
+
+  // Make sure each thread has read its value.
+  __syncthreads();
+
+  // Compute the prefix sum.
+  int prefixSum{0}, totalSum{0};
+  Scan(smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+  // Update the histogram with the prefix sums.
+  if (threadIdx.x < kNumBins) {
+    smemHistogram[threadIdx.x] = prefixSum;
+  }
+
+  // Make sure the data is in shared memory.
+  __syncthreads();
+
+  // Find the last valid bin.
+  if (threadIdx.x < kNumBins) {
+    int nextPrefixSum = threadIdx.x == kNumBins - 1 ? totalSum : smemHistogram[threadIdx.x + 1];
+    if (prefixSum < kTopK && nextPrefixSum >= kTopK) {
+      smemThresholdBinIdx[0] = threadIdx.x;
+    }
+  }
+
+  // Clear the counter to store the items for the final phase.
+  if (threadIdx.x == 0) {
+    smemFinalDstIdx[0] = 0;
+  }
+
+  // Make sure the data is in shared memory.
+  __syncthreads();
+
+  // The threshold bin.
+  int thresholdBinIdx = smemThresholdBinIdx[0];
+
+  // Fetch elements one-by-one and populate the shared memory buffers.
+  for (int idx = threadIdx.x; idx < length; idx += kNumThreadsPerBlock) {
+    float logit = logits[idx];
+    uint16_t binIdx = extractBinIdx(logit);
+    if (binIdx < thresholdBinIdx) {
+      int dstIdx = atomicAdd(&smemHistogram[binIdx], 1);
+      smemLogits[dstIdx] = logit;
+      smemIndices[dstIdx] = idx;
+    } else if (binIdx == thresholdBinIdx) {
+      int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+      if (dstIdx < kNumFinalItems) {
+        smemFinal.items.logits[dstIdx] = logit;
+        smemFinal.items.indices[dstIdx] = idx;
+      }
+    }
+  }
+
+  // Make sure the elements are in shared memory.
+  __syncthreads();
+
+  // The logits of the elements to be sorted in the final pass.
+  float finalLogits[kNumFinalItemsPerThread];
+  // The indices of the elements to be sorted in the final pass.
+  int finalIndices[kNumFinalItemsPerThread];
+
+// Init.
+#pragma unroll
+  for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+    finalLogits[ii] = -FLT_MAX;
+  }
+
+// Read the elements from SMEM.
+#pragma unroll
+  for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+    int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+    if (srcIdx < smemFinalDstIdx[0]) {
+      finalLogits[ii] = smemFinal.items.logits[srcIdx];
+      finalIndices[ii] = smemFinal.items.indices[srcIdx];
+    }
+  }
+
+  // Make sure the shared memory has been read.
+  __syncthreads();
+
+  // Sort the elements.
+  FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+  // Copy the data back to the shared memory storage.
+  int baseIdx = thresholdBinIdx > 0 ? smemHistogram[thresholdBinIdx - 1] : 0;
+#pragma unroll
+  for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+    int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+    int dstIdx = baseIdx + srcIdx;
+    if (dstIdx < kTopK) {
+      smemLogits[dstIdx] = finalLogits[ii];
+      smemIndices[dstIdx] = finalIndices[ii];
+    }
+  }
+
+  // Make sure the data is in shared memory.
+  __syncthreads();
+
+  // The topK logits.
+  float topKLogits[kNumTopKItemsPerThread];
+  // The topK indices.
+  int topKIndices[kNumTopKItemsPerThread];
+
+// Load from shared memory.
+#pragma unroll
+  for (int ii = 0; ii < kNumTopKItemsPerThread; ++ii) {
+    topKLogits[ii] = smemLogits[ii * kNumThreadsPerBlock + threadIdx.x];
+    topKIndices[ii] = smemIndices[ii * kNumThreadsPerBlock + threadIdx.x];
+  }
+
+  // Sort the elements.
+  TopKSort(smemFinal.topKSort).SortDescendingBlockedToStriped(topKLogits, topKIndices);
+
+// Store to global memory.
+#pragma unroll
+  for (int ii = 0; ii < kNumTopKItemsPerThread; ++ii) {
+    int offset = ii * kNumThreadsPerBlock + threadIdx.x;
+    outIndices[offset] = topKIndices[ii];
+  }
+}
+
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
     void topk_kernel(const FastTopKParams params) {
   const auto& [input, indices, lengths, input_stride] = params;
@@ -239,6 +807,25 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // topk
   } else {
     return fast_topk_cuda_tl(score, indice, length);
   }
+}
+__global__ __launch_bounds__(kThreadsPerBlockVllm)  // topk
+    void vllm_topk_kernel(const FastTopKParams params) {
+  const auto& [input, indices, lengths, input_stride] = params;
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto length = lengths[bid];
+  const auto indice = indices + bid * TopK;
+  const auto score = input + bid * input_stride;
+  return topKPerRow<kThreadsPerBlockVllm>(score, indice, length);
+}
+
+__global__ __launch_bounds__(kThreadsPerBlockVllm)  // topk
+    void vllm_topk_kernel_optimized(const FastTopKParams params) {
+  const auto& [input, indices, lengths, input_stride] = params;
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto length = lengths[bid];
+  const auto indice = indices + bid * TopK;
+  const auto score = input + bid * input_stride;
+  return topKPerRowOptimized<512>(score, indice, length);
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // decode
@@ -368,6 +955,34 @@ void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor length
   const auto block = dim3{kThreadsPerBlock};
   setup_kernel_smem_once<topk_kernel, kSmem>();
   topk_kernel<<<grid, block, kSmem, stream>>>(params);
+  const auto result = cudaGetLastError();
+  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+}
+
+void vllm_fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths) {
+  CHECK_CUDA(score);
+  CHECK_CUDA(indices);
+  CHECK_CUDA(lengths);
+  const auto params = get_params(score, lengths, indices);
+  const auto B = score.size(0);
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto block = dim3{kThreadsPerBlockVllm};
+  vllm_topk_kernel<<<grid, block, 0, stream>>>(params);
+  const auto result = cudaGetLastError();
+  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+}
+
+void vllm_fast_topk_optimized_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths) {
+  CHECK_CUDA(score);
+  CHECK_CUDA(indices);
+  CHECK_CUDA(lengths);
+  const auto params = get_params(score, lengths, indices);
+  const auto B = score.size(0);
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  const auto grid = dim3{static_cast<uint32_t>(B)};
+  const auto block = dim3{kThreadsPerBlockVllm};
+  vllm_topk_kernel_optimized<<<grid, block, 0, stream>>>(params);
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }

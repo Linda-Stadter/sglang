@@ -175,6 +175,8 @@ void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
 void fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void vllm_fast_topk_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
+void vllm_fast_topk_optimized_interface(at::Tensor score, at::Tensor indices, at::Tensor lengths);
 void fast_topk_transform_interface(
     at::Tensor score,
     at::Tensor lengths,
