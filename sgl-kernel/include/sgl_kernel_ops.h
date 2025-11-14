@@ -173,23 +173,32 @@ void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
 void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
 void fast_topk_interface(
-    const at::Tensor& score,
-    at::Tensor& indices,
-    const at::Tensor& lengths,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    at::Tensor logits,
+    at::Tensor outIndices,
+    at::Tensor rowStarts,
+    at::Tensor rowEnds,
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    bool isPrefill);
 void fast_topk_transform_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
+    at::Tensor score,
+    at::Tensor rowStarts,
+    at::Tensor rowEnds,
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    bool isPrefill);
 void fast_topk_transform_ragged_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
+    at::Tensor score,
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    at::Tensor topk_indices_ragged,
+    at::Tensor rowStarts,
+    at::Tensor rowEnds,
     const at::Tensor& topk_indices_offset,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    bool isPrefill);
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);

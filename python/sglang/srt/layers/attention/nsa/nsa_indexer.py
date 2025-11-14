@@ -57,6 +57,8 @@ class BaseIndexerMetadata(ABC):
         self,
         logits: torch.Tensor,
         topk: int,
+        is_prefill: bool,
+        ks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits and possibly transform the result.
@@ -323,7 +325,10 @@ class Indexer(CustomOp):
         )
 
         # NOTE(dark): logits should be cleaned in topk_transform
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        is_prefill = forward_batch.forward_mode.is_extend()
+        topk_result = metadata.topk_transform(
+            logits, self.index_topk, is_prefill=is_prefill
+        )
         return topk_result
 
     def _get_topk_ragged(
@@ -416,7 +421,10 @@ class Indexer(CustomOp):
         assert logits.shape[0] == len(seq_lens_expanded)
         assert logits.shape[1] == k_offset
 
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+        is_prefill = forward_batch.forward_mode.is_extend()
+        raw_topk_result = metadata.topk_transform(
+            logits, self.index_topk, is_prefill=is_prefill, ks=ks
+        )
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
         )
@@ -462,7 +470,10 @@ class Indexer(CustomOp):
             dtype=torch.float32,
             device=x.device,
         )
-        return metadata.topk_transform(dummy_logits, self.index_topk)
+        is_prefill = forward_batch.forward_mode.is_extend()
+        return metadata.topk_transform(
+            dummy_logits, self.index_topk, is_prefill=is_prefill, ks=None
+        )
 
     def forward_indexer(
         self,

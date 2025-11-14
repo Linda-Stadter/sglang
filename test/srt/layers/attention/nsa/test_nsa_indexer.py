@@ -84,7 +84,9 @@ class MockIndexerMetadata(BaseIndexerMetadata):
             result.extend(range(1, seq_len + 1))
         return torch.tensor(result, dtype=torch.int32, device=self.device)
 
-    def topk_transform(self, logits: torch.Tensor, topk: int) -> torch.Tensor:
+    def topk_transform(
+        self, logits: torch.Tensor, topk: int, is_prefill: bool, ks=None
+    ) -> torch.Tensor:
         """
         Perform topk selection on the logits.
         For testing, just return the topk indices.
@@ -543,7 +545,8 @@ class TestNSAIndexer(CustomTestCase):
         # Test topk_transform
         logits = torch.randn(batch_size, 128, device="cuda")
         topk = 64
-        topk_indices = metadata.topk_transform(logits, topk)
+        is_prefill = False
+        topk_indices = metadata.topk_transform(logits, topk, is_prefill)
         self.assertEqual(topk_indices.shape, (batch_size, topk))
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")

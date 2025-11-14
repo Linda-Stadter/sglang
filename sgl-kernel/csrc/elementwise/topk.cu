@@ -16,469 +16,891 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <optional>
 
 namespace {
-
-constexpr int TopK = 2048;
-constexpr int kThreadsPerBlock = 1024;
-constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t);  // 128KB
-
-struct FastTopKParams {
-  const float* __restrict__ input;         // [B, input_stride]
-  const int32_t* __restrict__ row_starts;  // [B]
-  int32_t* __restrict__ indices;           // [B, TopK]
-  int32_t* __restrict__ lengths;           // [B]
-  int64_t input_stride;
-};
-
-// when length <= TopK, we can directly write the indices
-__device__ void naive_topk_cuda(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
-  const auto tid = threadIdx.x;
-  for (int i = tid; i < TopK; i += kThreadsPerBlock) {
-    indice[i] = (i < length) ? i : -1;
-  }
-}
-
-// keep the first `length` entries, set others to -1
-__device__ void naive_topk_transform(
-    const float* __restrict__ score,
-    int32_t length,
-    int32_t* __restrict__ dst_page_table,
-    const int32_t* __restrict__ src_page_table) {
-  const auto tid = threadIdx.x;
-  for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
-    dst_page_table[i] = (i < length) ? src_page_table[i] : -1;
-  }
-}
-
-// keep the first `length` entries, set others to -1
-__device__ void naive_topk_transform_ragged(
-    const float* __restrict__ score, int32_t length, int32_t* __restrict__ topk_indices_ragged, int32_t offset) {
-  const auto tid = threadIdx.x;
-  for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
-    topk_indices_ragged[i] = (i < length) ? static_cast<int32_t>(i) + offset : -1;
-  }
-}
-
-__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
-  __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-  return static_cast<uint8_t>(key >> 8);
-}
+constexpr int WARP_SIZE = 32;
+using WideT = float4;
 
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
 }
 
-__device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
-  // An optimized topk kernel copied from tilelang kernel
-  // We assume length > TopK here, or it will crash
-  int topk = TopK;
-  constexpr auto BLOCK_SIZE = 1024;
-  constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+template <int step>
+static inline __device__ uint32_t extractBinIdx(float x) {
+  uint32_t bits = __float_as_uint(x);
+  bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
 
-  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
-  alignas(128) __shared__ int s_counter;
-  alignas(128) __shared__ int s_threshold_bin_id;
-  alignas(128) __shared__ int s_num_input[2];
-
-  auto& s_histogram = s_histogram_buf[0];
-  // allocate for two rounds
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
-
-  const int tx = threadIdx.x;
-
-  // stage 1: 8bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
-  __syncthreads();
-
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
+  if constexpr (step == 0) {
+    return bits >> 21;
+  } else if constexpr (step == 1) {
+    return (bits >> 10) & 0x7ff;
+  } else {
+    return bits & 0x3ff;
   }
+}
+
+template <int shift>
+static inline __device__ bool isPartialMatch(float x, uint32_t pattern) {
+  if constexpr (shift == 0) {
+    return true;
+  }
+  uint32_t bits = __float_as_uint(x);
+  bits = (bits & 0x80000000) ? bits : ~bits & 0x7fffffff;
+  return (bits ^ pattern) >> shift == 0;
+}
+
+/**
+ * Map a Func over the input data, using vectorized load instructions if
+ * possible.
+ *
+ * NB: in future, we should move this to
+ * cpp/include/raft/linalg/detail/unary_op.cuh, which currently does not support
+ * the second lambda argument (index of an element)
+ *
+ * @tparam T element type
+ * @tparam IdxT indexing type
+ * @tparam Func void (T x, IdxT idx)
+ *
+ * @param thread_rank rank of the calling thread among all participating threads
+ * @param num_threads number of the threads that participate in processing
+ * @param in the input data
+ * @param len the number of elements to read
+ * @param f the lambda taking two arguments (T x, IdxT idx)
+ */
+template <typename T, typename idxT, typename Func>
+__device__ void vectorized_process(size_t thread_rank, size_t num_threads, const T* in, idxT len, Func f) {
+  if constexpr (sizeof(T) >= sizeof(WideT)) {
+    for (idxT i = thread_rank; i < len; i += num_threads) {
+      f(in[i], i);
+    }
+  } else {
+    static_assert(sizeof(WideT) % sizeof(T) == 0);
+    constexpr int items_per_scalar = sizeof(WideT) / sizeof(T);
+    // TODO: it's UB
+    union {
+      WideT scalar;
+      T array[items_per_scalar];
+    } wide;
+
+    int skip_cnt = (reinterpret_cast<size_t>(in) % sizeof(WideT))
+                       ? ((sizeof(WideT) - reinterpret_cast<size_t>(in) % sizeof(WideT)) / sizeof(T))
+                       : 0;
+    if (skip_cnt > len) {
+      skip_cnt = len;
+    }
+    const WideT* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
+    const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+
+    for (idxT i = thread_rank; i < len_cast; i += num_threads) {
+      wide.scalar = in_cast[i];
+      const idxT real_i = skip_cnt + i * items_per_scalar;
+#pragma unroll
+      for (int j = 0; j < items_per_scalar; ++j) {
+        f(wide.array[j], real_i + j);
+      }
+    }
+
+    static_assert(WARP_SIZE >= items_per_scalar);
+    // and because items_per_scalar > skip_cnt, WARP_SIZE > skip_cnt
+    // no need to use loop
+    if (thread_rank < skip_cnt) {
+      f(in[thread_rank], thread_rank);
+    }
+    // because len_cast = (len - skip_cnt) / items_per_scalar,
+    // len_cast * items_per_scalar + items_per_scalar > len - skip_cnt;
+    // and so
+    // len - (skip_cnt + len_cast * items_per_scalar) < items_per_scalar <=
+    // WARP_SIZE no need to use loop
+    const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+    if (remain_i < len) {
+      f(in[remain_i], remain_i);
+    }
+  }
+}
+
+template <
+    int step,
+    int kNumThreadsPerBlock,
+    int kNumBins,
+    int kTopK,
+    int kNumFinalItems,
+    bool multipleBlocksPerRow,
+    bool mergeBlocks,
+    typename SmemFinalType,
+    typename SmemOutputType>
+__device__ bool processHistogramStep(
+    const int* indices,
+    const float* logits,
+    int rowEnd,
+    uint32_t& logitPattern,
+    int& thresholdBinIdx,
+    SmemOutputType& smemOutput,
+    int* smemThresholdBinIdx,
+    int* smemFinalDstIdx,
+    int* smemFinalBinSize,
+    int* smemFoundTopKValues,
+    SmemFinalType& smemFinal,
+    int stride1,
+    int rowStart,
+    int offset = 0) {
+  // Clear the histogram.
+#pragma unroll
+  for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
+    smemFinal.histo.data[idx] = 0;
+  }
+
+  // Make sure the histogram is ready.
   __syncthreads();
 
-  const auto run_cumsum = [&] {
-#pragma unroll 8
-    for (int i = 0; i < 8; ++i) {
-      static_assert(1 << 8 == RADIX);
-      if (C10_LIKELY(tx < RADIX)) {
-        const auto j = 1 << i;
-        const auto k = i & 1;
-        auto value = s_histogram_buf[k][tx];
-        if (tx < RADIX - j) {
-          value += s_histogram_buf[k][tx + j];
-        }
-        s_histogram_buf[k ^ 1][tx] = value;
-      }
-      __syncthreads();
+  // Update pattern
+  constexpr auto patternShift = step == 0 ? 0 : step == 1 ? 21 : 10;
+  if constexpr (step == 1) {
+    logitPattern = static_cast<uint32_t>(thresholdBinIdx & 0x7ff) << patternShift;
+  } else if constexpr (step == 2) {
+    logitPattern |= static_cast<uint32_t>(thresholdBinIdx & 0x7ff) << patternShift;
+  }
+
+  auto distributeToBins = [&](float logit, int /* idx */ = 0) {
+    if (isPartialMatch<patternShift>(logit, logitPattern)) {
+      uint32_t binIdx = extractBinIdx<step>(logit);
+      atomicAdd(&smemFinal.histo.data[binIdx], 1);
     }
   };
 
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
+  // Distribute the elements to the histogram bins.
+  if (stride1 == 1) {
+    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, distributeToBins);
+  } else {
+    for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock) {
+      float logit = logits[idx * stride1];
+      distributeToBins(logit, idx);
+    }
   }
+  // Make sure the histogram is ready.
   __syncthreads();
 
-  const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
+  // Reads the value of the starting position in the smemOutput array
+  int lastValue = smemFoundTopKValues[0];
 
-  if (topk == 0) {
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      }
-    }
-    __syncthreads();
-    return;
-  } else {
-    __syncthreads();
-    if (tx < RADIX + 1) {
-      s_histogram[tx] = 0;
-    }
+  for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++) {
+    // Read the values from SMEM.
+    int idx = threadIdx.x + kNumThreadsPerBlock * round;
+    int binCount{0};
+    binCount = smemFinal.histo.data[idx];
+
+    // Make sure each thread has read its value.
     __syncthreads();
 
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      } else if (bin == threshold_bin) {
-        const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        /// NOTE: (dark) fuse the histogram computation here
-        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-          s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
-        }
+    // Compute the prefix sum.
+    int prefixSum{0}, totalSum{0};
+    using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
+    Scan(smemFinal.histo.scan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+    // Update the histogram with the prefix sums.
+    prefixSum += lastValue;
+    totalSum += lastValue;
+    smemFinal.histo.data[idx] = prefixSum;
+
+    // Make sure the data is in shared memory.
+    __syncthreads();
+
+    // Find the last valid bin.
+    bool foundThreshold = false;
+    if (prefixSum < kTopK) {
+      int nextPrefixSum = threadIdx.x == kNumThreadsPerBlock - 1 ? totalSum : smemFinal.histo.data[idx + 1];
+
+      if (nextPrefixSum >= kTopK) {
+        smemThresholdBinIdx[0] = idx;
+        smemFinalBinSize[0] = nextPrefixSum - prefixSum;
+        foundThreshold = true;
       }
     }
-    __syncthreads();
+
+    // Early exit: if any thread found the threshold, we can skip remaining rounds
+    if (__syncthreads_or(foundThreshold)) {
+      break;
+    }
+
+    lastValue = totalSum;
   }
 
-  // stage 2: refine with 8bit radix passes
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
-    __shared__ int s_last_remain;
-    const auto r_idx = round % 2;
+  // Make sure the data is in shared memory.
+  __syncthreads();
 
-    // clip here to prevent overflow
-    const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
+  // The threshold bin.
+  thresholdBinIdx = smemThresholdBinIdx[0];
 
-    run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-      s_threshold_bin_id = tx;
-      s_num_input[r_idx ^ 1] = 0;
-      s_last_remain = topk - s_histogram[tx + 1];
-    }
-    __syncthreads();
+  auto processBins = [&](float logit, int idx) {
+    if (isPartialMatch<patternShift>(logit, logitPattern)) {
+      uint32_t binIdx = extractBinIdx<step>(logit);
+      if (binIdx < thresholdBinIdx) {
+        // The element is part of the top-k selection
+        int dstIdx = atomicAdd(&smemFoundTopKValues[0], 1);
 
-    const auto threshold_bin = s_threshold_bin_id;
-    topk -= s_histogram[threshold_bin + 1];
-
-    if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+        if constexpr (mergeBlocks) {
+          smemOutput.indices[dstIdx] = indices[idx];
+        } else if constexpr (multipleBlocksPerRow) {
+          smemOutput.indices[dstIdx] = idx + rowStart;
+          smemOutput.logits[dstIdx] = logit;
+        } else {
+          smemOutput.indices[dstIdx] = idx;
         }
       }
-      __syncthreads();
-      break;
-    } else {
-      __syncthreads();
-      if (tx < RADIX + 1) {
-        s_histogram[tx] = 0;
-      }
-      __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx + row_start];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[TopK - pos] = idx;
-            }
+      if constexpr (step < 2) {
+        // Only fill the final items for sorting if the threshold bin fits
+        if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems) {
+          int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+          smemFinal.items.logits[dstIdx] = logit;
+          if constexpr (mergeBlocks) {
+            smemFinal.items.indices[dstIdx] = indices[idx];
+          } else if constexpr (multipleBlocksPerRow) {
+            smemFinal.items.indices[dstIdx] = idx + rowStart;
           } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-              /// NOTE: (dark) fuse the histogram computation here
-              s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
+            smemFinal.items.indices[dstIdx] = idx;
+          }
+        } else if (binIdx == thresholdBinIdx && smemFinalBinSize[0] > kNumFinalItems) {
+          // Load elements for next it
+        }
+      } else {
+        if (binIdx == thresholdBinIdx) {
+          // The elements in the threshold bin share the same 32 bits at step 2
+          int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
+          if (dstIdx < kTopK) {
+            if constexpr (mergeBlocks) {
+              smemOutput.indices[dstIdx] = indices[idx];
+
+            } else if constexpr (multipleBlocksPerRow) {
+              smemOutput.indices[dstIdx] = idx + rowStart;
+              smemOutput.logits[dstIdx] = logit;
+            } else {
+              smemOutput.indices[dstIdx] = idx;
             }
           }
         }
       }
-      __syncthreads();
+    }
+  };
+
+  if (stride1 == 1) {
+    vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, processBins);
+  } else {
+    for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock) {
+      float logit = logits[idx * stride1];
+      processBins(logit, idx);
     }
   }
+
+  // Make sure the elements are in shared memory.
+  __syncthreads();
+
+  // Check if we should continue to next step
+  return smemFinalBinSize[0] > kNumFinalItems;
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock)  // topk
-    void topk_kernel(const FastTopKParams params) {
-  const auto& [input, row_starts, indices, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
-  const auto length = lengths[bid];
-  const auto indice = indices + bid * TopK;
-  const auto score = input + bid * input_stride;
-  if (length <= TopK) {
-    return naive_topk_cuda(score, indice, length);
-  } else {
-    return fast_topk_cuda_tl(score, indice, row_start, length);
-  }
-}
+template <
+    int kNumThreadsPerBlock,
+    int kNumBins,
+    int kTopK,
+    bool useRadixSort,
+    bool multipleBlocksPerRow,
+    bool mergeBlocks,
+    bool fuseTransformDecode,
+    bool fuseTransformPrefill>
+static __device__ void topKPerRowJob(
+    const int* indices,
+    const float* logits,
+    int rowStart,
+    int rowEnd,
+    int* outIndices,
+    float* outLogits,
+    int stride1,
+    int offset = 0,
+    const int32_t* __restrict__ src_page_table = nullptr,
+    int src_stride = 0,
+    const int32_t* __restrict__ cu_seqlens_q = nullptr,
+    int prefill_bs = 0) {
+  // The number of slots for the final pass.
+  static constexpr int kNumFinalItems = 2048;
+  // The number of elements per thread for the final sort.
+  static constexpr int kNumFinalItemsPerThread = kNumFinalItems / kNumThreadsPerBlock;
+  // The class to sort the elements during the final pass.
+  using FinalSort = cub::BlockRadixSort<float, kNumThreadsPerBlock, kNumFinalItemsPerThread, int>;
+  using FinalSortTempStorage = std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+  // The class to compute the inclusive prefix-sum over the histogram.
+  using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
-__global__ __launch_bounds__(kThreadsPerBlock)  // decode
-    void topk_transform_decode_kernel(
-        const FastTopKParams params,
-        int32_t* __restrict__ dst_page_table,
-        const int32_t* __restrict__ src_page_table,
-        const int64_t src_stride) {
-  const auto& [input, _1, _2, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto tid = threadIdx.x;
-  const auto row_start = 0;
-  const auto length = lengths[bid];
-  const auto src_page_entry = src_page_table + bid * src_stride;
-  const auto dst_page_entry = dst_page_table + bid * TopK;
-  const auto score = input + bid * input_stride;
-  if (length <= TopK) {
-    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
-  } else {
-    __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
-  }
-}
+  // The structure to store the final items (for the final pass).
+  struct FinalItems {
+    // Shared memory to store the indices for the final pass.
+    int indices[kNumFinalItems];
+    // Shared memory to store the logits for the final pass.
+    float logits[kNumFinalItems];
+  };
 
-__global__ __launch_bounds__(kThreadsPerBlock)  // prefill
-    void topk_transform_prefill_kernel(
-        const FastTopKParams params,
-        int32_t* __restrict__ dst_page_table,
-        const int32_t* __restrict__ src_page_table,
-        const int64_t src_stride,
-        const int32_t* __restrict__ cu_seqlens_q,
-        const int64_t prefill_bs) {
-  const auto& [input, row_starts, _, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto tid = threadIdx.x;
-  const auto length = lengths[bid];
-  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
-  const auto dst_page_entry = dst_page_table + bid * TopK;
-  const auto score = input + bid * input_stride;
+  struct Histogram {
+    typename Scan::TempStorage scan;
+    int data[kNumBins];
+  };
 
-  /// NOTE: prefill bs is usually small, we can just use a simple loop here
-  /// We ensure that last cu_seqlens is equal to number of blocks launched
+  // Shared memory to compute the block sort.
+  __shared__ union {
+    FinalItems items;
+    FinalSortTempStorage finalSort;
+    Histogram histo;
+  } smemFinal;
+
+  // Shared memory to store the selected indices.
+  // If we are processing using multiple blocks, we need to store the logits and indices.
+  struct SmemOutputIndices {
+    int indices[kTopK];
+  };
+  struct SmemOutputLogitsAndIndices {
+    int indices[kTopK];
+    float logits[kTopK];
+  };
+  using SmemOutput_t = std::conditional_t<multipleBlocksPerRow, SmemOutputLogitsAndIndices, SmemOutputIndices>;
+  __shared__ SmemOutput_t smemOutput;
+
+  // Shared memory to store the threshold bin.
+  __shared__ int smemThresholdBinIdx[1];
+  // Shared memory counter to register the candidates for the final phase.
+  __shared__ int smemFinalDstIdx[1];
+  // Shared memory to determine if the threshold bin fits in the final items.
+  __shared__ int smemFinalBinSize[1];
+  // Shared memory to keep track of the top-k values found so far by the previous iterations
+  __shared__ int smemFoundTopKValues[1];
+
+  // The length of the row.
+  int rowLen = rowEnd - rowStart;
+
   __shared__ const int32_t* s_src_page_entry;
-  if (C10_LIKELY(prefill_bs <= kThreadsPerBlock)) {
-    if (tid < prefill_bs) {
-      if (bid >= cu_seqlens_q[tid] && bid < cu_seqlens_q[tid + 1]) {
-        s_src_page_entry = src_page_table + tid * src_stride;
-      }
-    }
-  } else {
-    for (int64_t i = tid; i < prefill_bs; i += kThreadsPerBlock) {
-      if (bid >= cu_seqlens_q[i] && bid < cu_seqlens_q[i + 1]) {
+  if constexpr (fuseTransformPrefill) {
+    for (int64_t i = threadIdx.x; i < prefill_bs; i += kNumThreadsPerBlock) {
+      if (blockIdx.x >= cu_seqlens_q[i] && blockIdx.x < cu_seqlens_q[i + 1]) {
         s_src_page_entry = src_page_table + i * src_stride;
       }
     }
   }
+  if constexpr (fuseTransformDecode) {
+    s_src_page_entry = src_page_table + blockIdx.x * src_stride;
+  }
+
   __syncthreads();
-  const auto src_page_entry = s_src_page_entry;
 
-  if (length <= TopK) {
-    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
-  } else {
-    __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
+  // Shortcut if the length of the row is smaller than Top-K. Indices are not
+  // sorted by their corresponding logit.
+  if (rowLen <= kTopK) {
+    for (int rowIt = threadIdx.x; rowIt < rowLen; rowIt += kNumThreadsPerBlock) {
+      if constexpr (fuseTransformDecode || fuseTransformPrefill) {
+        outIndices[rowIt] = s_src_page_entry[rowIt + offset];
+
+      } else {
+        if constexpr (multipleBlocksPerRow) {
+          outIndices[rowIt] = rowIt + offset + rowStart;
+          outLogits[rowIt] = logits[rowIt + rowStart];
+        } else {
+          outIndices[rowIt] = rowIt + offset;
+        }
+      }
+    }
+    // maybe not execute when not fusetrans
+    for (int rowIt = rowLen + threadIdx.x; rowIt < kTopK; rowIt += kNumThreadsPerBlock) {
+      outIndices[rowIt] = -1;
+
+      if constexpr (multipleBlocksPerRow) {
+        outLogits[rowIt] = -FLT_MAX;
+      }
+    }
+
+    return;
+  }
+  // Initialize values
+  if (threadIdx.x == 0) {
+    smemFinalDstIdx[0] = 0;
+    smemFoundTopKValues[0] = 0;
+  }
+  __syncthreads();
+  int thresholdBinIdx = -1;
+  uint32_t logitPattern = 0;
+
+  // Step 0: Process first 11 bits
+  bool continueToNextStep =
+      processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kTopK, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+          indices,
+          logits,
+          rowEnd,
+          logitPattern,
+          thresholdBinIdx,
+          smemOutput,
+          smemThresholdBinIdx,
+          smemFinalDstIdx,
+          smemFinalBinSize,
+          smemFoundTopKValues,
+          smemFinal,
+          stride1,
+          rowStart);
+
+  if (continueToNextStep) {
+    // Step 1: Process next 11 bits
+    continueToNextStep = processHistogramStep<
+        1,
+        kNumThreadsPerBlock,
+        kNumBins,
+        kTopK,
+        kNumFinalItems,
+        multipleBlocksPerRow,
+        mergeBlocks>(
+        indices,
+        logits,
+        rowEnd,
+        logitPattern,
+        thresholdBinIdx,
+        smemOutput,
+        smemThresholdBinIdx,
+        smemFinalDstIdx,
+        smemFinalBinSize,
+        smemFoundTopKValues,
+        smemFinal,
+        stride1,
+        rowStart);
+
+    if (continueToNextStep) {
+      // Step 2: Process final 10 bits
+      processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kTopK, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
+          indices,
+          logits,
+          rowEnd,
+          logitPattern,
+          thresholdBinIdx,
+          smemOutput,
+          smemThresholdBinIdx,
+          smemFinalDstIdx,
+          smemFinalBinSize,
+          smemFoundTopKValues,
+          smemFinal,
+          stride1,
+          rowStart);
+    }
+  }
+
+  if (!continueToNextStep) {
+    // The histogram did not proceed to the final 10 bits, therefore we need to sort the final
+    // items The logits of the elements to be sorted in the final pass.
+    if constexpr (useRadixSort) {
+      // Sorting with radix sort
+      float finalLogits[kNumFinalItemsPerThread];
+      // The indices of the elements to be sorted in the final pass.
+      int finalIndices[kNumFinalItemsPerThread];
+
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        finalLogits[ii] = -FLT_MAX;
+      }
+
+      // Read the elements from SMEM.
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+        if (srcIdx < smemFinalDstIdx[0]) {
+          finalLogits[ii] = smemFinal.items.logits[srcIdx];
+          finalIndices[ii] = smemFinal.items.indices[srcIdx];
+        }
+      }
+      // Make sure the shared memory has been read.
+      __syncthreads();
+
+      // Sort the elements.
+      FinalSort(smemFinal.finalSort).SortDescendingBlockedToStriped(finalLogits, finalIndices);
+
+      // Copy the data back to the shared memory storage.
+      int baseIdx = smemFoundTopKValues[0];
+
+#pragma unroll
+      for (int ii = 0; ii < kNumFinalItemsPerThread; ++ii) {
+        int srcIdx = ii * kNumThreadsPerBlock + threadIdx.x;
+        int dstIdx = baseIdx + srcIdx;
+
+        if (dstIdx < kTopK) {
+          smemOutput.indices[dstIdx] = finalIndices[ii];
+          if constexpr (multipleBlocksPerRow) {
+            smemOutput.logits[dstIdx] = finalLogits[ii];
+          }
+        }
+      }
+    } else {
+      // Sorting with insertion sort
+      auto baseIdx = smemFoundTopKValues[0];
+      for (int i = threadIdx.x; i < smemFinalDstIdx[0]; i += kNumThreadsPerBlock) {
+        int outIndex = 0;
+        auto logit = smemFinal.items.logits[i];
+
+        for (int j = 0; j < smemFinalDstIdx[0]; j++) {
+          auto otherLogit = smemFinal.items.logits[j];
+          if (logit < otherLogit || (logit == otherLogit && i < j)) {
+            outIndex++;
+          }
+        }
+        // Store if outIndex is in bounds
+        if (outIndex + baseIdx < kTopK) {
+          smemOutput.indices[outIndex + baseIdx] = smemFinal.items.indices[i];
+          if constexpr (multipleBlocksPerRow) {
+            smemOutput.logits[outIndex + baseIdx] = smemFinal.items.logits[i];
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // Store to global memory.
+  for (int i = threadIdx.x; i < kTopK; i += kNumThreadsPerBlock) {
+    if constexpr (fuseTransformDecode || fuseTransformPrefill) {
+      outIndices[i] = s_src_page_entry[smemOutput.indices[i] + offset];
+    } else {
+      if constexpr (multipleBlocksPerRow) {
+        outIndices[i] = smemOutput.indices[i];
+        outLogits[i] = smemOutput.logits[i];
+      } else {
+        outIndices[i] = smemOutput.indices[i] + offset;
+      }
+    }
   }
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock)  // prefill, ragged kv
-    void topk_transform_prefill_ragged_kernel(
-        const FastTopKParams params,
-        int32_t* __restrict__ topk_indices_ragged,
-        const int32_t* __restrict__ topk_indices_offset) {
-  const auto& [input, row_starts, _, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto tid = threadIdx.x;
-  const auto row_start = row_starts == nullptr ? 0 : row_starts[bid];
-  const auto length = lengths[bid];
-  const auto dst_indices_entry = topk_indices_ragged + bid * TopK;
-  const auto score = input + bid * input_stride;
-  const auto offset = topk_indices_offset[bid];
+template <
+    int kNumThreadsPerBlock,
+    bool useRadixSort,
+    bool multipleBlocksPerRow = false,
+    bool mergeBlocks = false,
+    bool fuseTransformDecode = false,
+    bool fuseTransformPrefill = false>
+static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRow(
+    const float* logits,
+    const int* rowStarts,
+    const int* rowEnds,
+    int* outIndices,
+    float* outLogits,
+    int stride0,
+    int stride1,
+    const int offsetIndex = 0,
+    const int numBlocksToMerge = 0,
+    const int* indices = nullptr,
+    const int* offsetPerRow = nullptr,
+    const int32_t* __restrict__ src_page_table = nullptr,
+    int src_stride = 0,
+    const int32_t* __restrict__ cu_seqlens_q = nullptr,
+    int prefill_bs = 0) {
+  // The number of bins in the histogram.
+  static constexpr int kNumBins = 2048;
 
-  if (length <= TopK) {
-    return naive_topk_transform_ragged(score, length, dst_indices_entry, offset);
-  } else {
-    __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, row_start, length);
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_indices_entry[idx_0] = pos_0 + offset;
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_indices_entry[idx_1] = pos_1 + offset;
-  }
-}
+  // The top-k width.
+  static constexpr int kTopK = 2048;
 
-auto get_params(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt,
-    std::optional<at::Tensor> indices_opt = std::nullopt) -> FastTopKParams {
-  const auto B = score.size(0);
-  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1);
-  if (row_starts_opt.has_value()) {
-    const auto& row_starts = row_starts_opt.value();
-    TORCH_CHECK(row_starts.dim() == 1);
-    TORCH_CHECK(row_starts.size(0) == B);
-  }
-  TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous());
-  TORCH_CHECK(lengths.size(0) == B);
-  int32_t* indices_data_ptr = nullptr;
-  if (indices_opt.has_value()) {
-    const auto& indices = indices_opt.value();
-    TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
-    TORCH_CHECK(indices.size(0) == B);
-    TORCH_CHECK(indices.size(1) == TopK);
-    indices_data_ptr = indices.data_ptr<int32_t>();
+  // The row computed by this block.
+  int rowIdx = blockIdx.x + offsetIndex;
+
+  // The range of logits within the row.
+  int offset = offsetPerRow ? offsetPerRow[rowIdx] : 0;
+  int rowStart = rowStarts ? rowStarts[rowIdx] : 0;
+  int rowEnd = rowEnds[rowIdx];
+
+  if constexpr (!multipleBlocksPerRow && !mergeBlocks) {
+    outIndices += rowIdx * kTopK;
+  } else if constexpr (multipleBlocksPerRow) {
+    const auto blockSize = rowEnd / gridDim.y;  // 16384 / 2 = 8192
+    rowStart = blockSize * blockIdx.y;          // 8192 * 1 = 8192
+    rowEnd = gridDim.y == blockIdx.y + 1 ? rowEnd : rowStart + blockSize;
+    outIndices += rowIdx * gridDim.y * kTopK + blockIdx.y * kTopK;
+    outLogits += rowIdx * gridDim.y * kTopK + blockIdx.y * kTopK;
+  } else if constexpr (mergeBlocks) {
+    rowEnd = numBlocksToMerge * kTopK;
+    indices += rowIdx * numBlocksToMerge * kTopK;
+    outIndices += rowIdx * kTopK;
   }
 
-  return FastTopKParams{
-      .input = score.data_ptr<float>(),
-      .row_starts = row_starts_opt.has_value() ? row_starts_opt->data_ptr<int32_t>() : nullptr,
-      .indices = indices_data_ptr,
-      .lengths = lengths.data_ptr<int32_t>(),
-      .input_stride = score.stride(0),
-  };
-}
+  // Local pointers to this block
+  logits += rowIdx * stride0;
 
-template <auto* f, size_t max_dynamic_smem>
-void setup_kernel_smem_once() {
-  [[maybe_unused]]
-  static const auto result =
-      [] { return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem); }();
-  TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+  topKPerRowJob<
+      kNumThreadsPerBlock,
+      kNumBins,
+      kTopK,
+      useRadixSort,
+      multipleBlocksPerRow,
+      mergeBlocks,
+      fuseTransformDecode,
+      fuseTransformPrefill>(
+      indices,
+      logits,
+      rowStart,
+      rowEnd,
+      outIndices,
+      outLogits,
+      stride1,
+      offset,
+      src_page_table,
+      src_stride,
+      cu_seqlens_q,
+      prefill_bs);
 }
-
 }  // namespace
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
 void fast_topk_interface(
-    const at::Tensor& score, at::Tensor& indices, const at::Tensor& lengths, std::optional<at::Tensor> row_starts_opt) {
-  CHECK_CUDA(score);
-  CHECK_CUDA(indices);
-  if (row_starts_opt.has_value()) {
-    CHECK_CUDA(row_starts_opt.value());
-  }
-  CHECK_CUDA(lengths);
-  const auto params = get_params(score, lengths, row_starts_opt, indices);
-  const auto B = score.size(0);
+    at::Tensor logits,
+    at::Tensor outIndices,
+    at::Tensor rowStarts,
+    at::Tensor rowEnds,
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    bool isPrefill) {
+  CHECK_CUDA(logits);
+  CHECK_CUDA(outIndices);
+  CHECK_CUDA(rowEnds);
+
+  constexpr int kTopK = 2048;
+  // Threshold of number of elements to use radix / insertion sort.
+  constexpr int kSortingAlgorithmThreshold = 12288;
+  const auto logitsPtr = logits.data_ptr<float>();
+
+  const auto outIndicesPtr = outIndices.data_ptr<int32_t>();
+  const auto rowEndsPtr = rowEnds.data_ptr<int32_t>();
+  const auto numRows = logits.size(0);
+  const auto numColumns = logits.size(1);
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
-  const auto block = dim3{kThreadsPerBlock};
-  setup_kernel_smem_once<topk_kernel, kSmem>();
-  topk_kernel<<<grid, block, kSmem, stream>>>(params);
+  const int stride0 = numColumns;
+  const int stride1 = 1;
+  const auto multipleBlocksPerRowConfig = 10;
+  const int splitWorkThreshold = 200 * 1000;
+
+  if (isPrefill) {
+    CHECK_CUDA(rowStarts);
+    const auto rowStartsPtr = rowStarts.data_ptr<int32_t>();
+    constexpr int kNumThreadsPerBlock = 512;
+    int numInsertionBlocks = std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
+    topKPerRow<kNumThreadsPerBlock, false><<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(
+        logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1);
+
+    if (numRows > kSortingAlgorithmThreshold) {
+      int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+      topKPerRow<kNumThreadsPerBlock, true><<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(
+          logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1, kSortingAlgorithmThreshold);
+    }
+  } else {
+    CHECK_CUDA(outIndicesAux);
+    CHECK_CUDA(outLogitsAux);
+    const auto rowStartsPtr = nullptr;
+    const auto outIndicesAuxPtr = outIndicesAux.data_ptr<int32_t>();
+    const auto outLogitsAuxPtr = outLogitsAux.data_ptr<float>();
+    if (numColumns < kSortingAlgorithmThreshold) {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+          logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1);
+    } else if (numColumns < splitWorkThreshold) {
+      if (numRows >= 1024) {
+        constexpr int kNumThreadsPerBlock = 256;
+        topKPerRow<kNumThreadsPerBlock, true><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1);
+      } else {
+        constexpr int kNumThreadsPerBlock = 512;
+        topKPerRow<kNumThreadsPerBlock, true><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1);
+      }
+    } else {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, true, true>
+          <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock, 0, stream>>>(
+              logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesAuxPtr, outLogitsAuxPtr, stride0, stride1);
+
+      constexpr int kNumThreadsPerBlockStep2 = 1024;
+      topKPerRow<kNumThreadsPerBlockStep2, true, false, true><<<numRows, kNumThreadsPerBlockStep2, 0, stream>>>(
+          outLogitsAuxPtr,
+          rowStartsPtr,
+          rowEndsPtr,
+          outIndicesPtr,
+          nullptr,
+          multipleBlocksPerRowConfig * kTopK,
+          1,
+          0,
+          multipleBlocksPerRowConfig,
+          outIndicesAuxPtr);
+    }
+  }
+
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
 }
 
 void fast_topk_transform_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
+    at::Tensor logits,
+    at::Tensor rowStarts,
+    at::Tensor rowEnds,
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt) {
-  CHECK_CUDA(score);
-  CHECK_CUDA(lengths);
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    bool isPrefill) {
+  CHECK_CUDA(logits);
   CHECK_CUDA(dst_page_table);
-  CHECK_CUDA(src_page_table);
-  CHECK_CUDA(cu_seqlens_q);
-  if (row_starts_opt.has_value()) {
-    CHECK_CUDA(row_starts_opt.value());
-  }
-  const auto params = get_params(score, lengths, row_starts_opt);
-  const auto B = score.size(0);
-  TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
-  TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
-  TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
-  const auto prefill_bs = cu_seqlens_q.size(0) - 1;
-  TORCH_CHECK(dst_page_table.size(0) == B);
-  TORCH_CHECK(dst_page_table.size(1) == TopK);
-  TORCH_CHECK(src_page_table.size(0) == prefill_bs);
-  TORCH_CHECK(prefill_bs <= B);  // prefill_bs should be smaller than expanded bs
+  CHECK_CUDA(rowEnds);
 
-  // launch kernel
+  constexpr int kTopK = 2048;
+  // Threshold of number of elements to use radix / insertion sort.
+  constexpr int kSortingAlgorithmThreshold = 12288;
+  const auto logitsPtr = logits.data_ptr<float>();
+
+  const auto outIndicesPtr = dst_page_table.data_ptr<int32_t>();
+
+  const auto rowEndsPtr = rowEnds.data_ptr<int32_t>();
+  const auto numRows = logits.size(0);
+  const auto numColumns = logits.size(1);
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
-  const auto block = dim3{kThreadsPerBlock};
-  const auto src_stride = src_page_table.stride(0);
+  const int stride0 = numColumns;
+  const int stride1 = 1;
+  const auto multipleBlocksPerRowConfig = 10;
+  const int splitWorkThreshold = 200 * 1000;
+  const auto src_page_tablePtr = src_page_table.data_ptr<int32_t>();
 
-  // dispatch to decode or prefill
-  // extend and draft extend: row_starts_opt is not null, invokes the prefill kernel
-  // decode: row_starts_opt is null, invokes the decode kernel
-  // target verify: row_starts_opt is null, invokes the prefill kernel
-  const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
-  if (is_decode) {
-    setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
-    topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
+  if (isPrefill) {
+    CHECK_CUDA(rowStarts);
+    CHECK_CUDA(cu_seqlens_q);
+    constexpr int kNumThreadsPerBlock = 512;
+    const auto src_stride = src_page_table.stride(0);
+    const auto rowStartsPtr = rowStarts.data_ptr<int32_t>();
+    const auto cu_seqlens_qPtr = cu_seqlens_q.data_ptr<int32_t>();
+    const auto prefill_bs = cu_seqlens_q.size(0) - 1;
+    int numInsertionBlocks = std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
+    topKPerRow<kNumThreadsPerBlock, false, false, false, false, true>
+        <<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr,
+            rowStartsPtr,
+            rowEndsPtr,
+            outIndicesPtr,
+            nullptr,
+            stride0,
+            stride1,
+            0,
+            0,
+            nullptr,
+            nullptr,
+            src_page_tablePtr,
+            src_stride,
+            cu_seqlens_qPtr,
+            prefill_bs);
+
+    if (numRows > kSortingAlgorithmThreshold) {
+      int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+      topKPerRow<kNumThreadsPerBlock, true, false, false, false, true>
+          <<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(
+              logitsPtr,
+              rowStartsPtr,
+              rowEndsPtr,
+              outIndicesPtr,
+              nullptr,
+              stride0,
+              stride1,
+              kSortingAlgorithmThreshold,
+              0,
+              nullptr,
+              nullptr,
+              src_page_tablePtr,
+              src_stride,
+              cu_seqlens_qPtr,
+              prefill_bs);
+    }
+
   } else {
-    setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
-    topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
-        params,
-        dst_page_table.data_ptr<int32_t>(),
-        src_page_table.data_ptr<int32_t>(),
-        src_stride,
-        cu_seqlens_q.data_ptr<int32_t>(),
-        prefill_bs);
+    CHECK_CUDA(outIndicesAux);
+    CHECK_CUDA(outLogitsAux);
+    const auto outIndicesAuxPtr = outIndicesAux.data_ptr<int32_t>();
+    const auto outLogitsAuxPtr = outLogitsAux.data_ptr<float>();
+    const auto rowStartsPtr = nullptr;
+    if (numColumns < kSortingAlgorithmThreshold) {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, false, false, false, true, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+          logitsPtr,
+          rowStartsPtr,
+          rowEndsPtr,
+          outIndicesPtr,
+          nullptr,
+          stride0,
+          stride1,
+          0,
+          0,
+          nullptr,
+          nullptr,
+          src_page_tablePtr);
+    } else if (numColumns < splitWorkThreshold) {
+      if (numRows >= 1024) {
+        constexpr int kNumThreadsPerBlock = 256;
+        topKPerRow<kNumThreadsPerBlock, true, false, false, true, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr,
+            rowStartsPtr,
+            rowEndsPtr,
+            outIndicesPtr,
+            nullptr,
+            stride0,
+            stride1,
+            0,
+            0,
+            nullptr,
+            nullptr,
+            src_page_tablePtr);
+      } else {
+        constexpr int kNumThreadsPerBlock = 512;
+        topKPerRow<kNumThreadsPerBlock, true, false, false, true, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr,
+            rowStartsPtr,
+            rowEndsPtr,
+            outIndicesPtr,
+            nullptr,
+            stride0,
+            stride1,
+            0,
+            0,
+            nullptr,
+            nullptr,
+            src_page_tablePtr);
+      }
+    } else {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, true, true, false, false, false>
+          <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock, 0, stream>>>(
+              logitsPtr,
+              rowStartsPtr,
+              rowEndsPtr,
+              outIndicesAuxPtr,
+              outLogitsAuxPtr,
+              stride0,
+              stride1,
+              0,
+              0,
+              nullptr,
+              nullptr,
+              src_page_tablePtr);
+
+      constexpr int kNumThreadsPerBlockStep2 = 1024;
+      topKPerRow<kNumThreadsPerBlockStep2, true, false, true, true, false>
+          <<<numRows, kNumThreadsPerBlockStep2, 0, stream>>>(
+              outLogitsAuxPtr,
+              rowStartsPtr,
+              rowEndsPtr,
+              outIndicesPtr,
+              nullptr,
+              multipleBlocksPerRowConfig * kTopK,
+              1,
+              0,
+              multipleBlocksPerRowConfig,
+              outIndicesAuxPtr,
+              nullptr,
+              src_page_tablePtr);
+    }
   }
 
   const auto result = cudaGetLastError();
@@ -486,36 +908,116 @@ void fast_topk_transform_interface(
 }
 
 void fast_topk_transform_ragged_interface(
-    const at::Tensor& score,
-    const at::Tensor& lengths,
-    at::Tensor& topk_indices_ragged,
+    at::Tensor score,
+    at::Tensor outIndicesAux,
+    at::Tensor outLogitsAux,
+    at::Tensor topk_indices_ragged,
+    at::Tensor rowStarts,
+    at::Tensor lengths,
     const at::Tensor& topk_indices_offset,
-    std::optional<at::Tensor> row_starts_opt) {
+    bool isPrefill) {
+  constexpr int kTopK = 2048;
+
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(topk_indices_ragged);
   CHECK_CUDA(topk_indices_offset);
-  if (row_starts_opt.has_value()) {
-    CHECK_CUDA(row_starts_opt.value());
-  }
-
-  const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(topk_indices_ragged.dim() == 2 && topk_indices_ragged.is_contiguous());
   TORCH_CHECK(topk_indices_offset.dim() == 1);
-
   TORCH_CHECK(topk_indices_ragged.size(0) == B);
-  TORCH_CHECK(topk_indices_ragged.size(1) == TopK);
+  TORCH_CHECK(topk_indices_ragged.size(1) == kTopK);
   TORCH_CHECK(topk_indices_offset.size(0) == B);
+  // Threshold of number of elements to use radix / insertion sort.
+  constexpr int kSortingAlgorithmThreshold = 12288;
+  const auto logitsPtr = score.data_ptr<float>();
+  const auto outIndicesPtr = topk_indices_ragged.data_ptr<int32_t>();
 
-  // launch kernel
+  const auto rowEndsPtr = lengths.data_ptr<int32_t>();
+  const auto offsetPtr = topk_indices_offset.data_ptr<int32_t>();
+  const auto numRows = score.size(0);
+  const auto numColumns = score.size(1);
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  const auto grid = dim3{static_cast<uint32_t>(B)};
-  const auto block = dim3{kThreadsPerBlock};
+  const int stride0 = numColumns;
+  const int stride1 = 1;
+  const auto multipleBlocksPerRowConfig = 10;
+  const int splitWorkThreshold = 200 * 1000;
 
-  setup_kernel_smem_once<topk_transform_prefill_ragged_kernel, kSmem>();
-  topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
-      params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
+  if (isPrefill) {
+    CHECK_CUDA(rowStarts);
+    const auto rowStartsPtr = rowStarts.data_ptr<int32_t>();
+    constexpr int kNumThreadsPerBlock = 512;
+    int numInsertionBlocks = std::min(static_cast<int>(numRows), kSortingAlgorithmThreshold);
+    topKPerRow<kNumThreadsPerBlock, false><<<numInsertionBlocks, kNumThreadsPerBlock, 0, stream>>>(
+        logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1, 0, 0, nullptr, offsetPtr);
+
+    if (numRows > kSortingAlgorithmThreshold) {
+      int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+      topKPerRow<kNumThreadsPerBlock, true><<<numRadixBlocks, kNumThreadsPerBlock, 0, stream>>>(
+          logitsPtr,
+          rowStartsPtr,
+          rowEndsPtr,
+          outIndicesPtr,
+          nullptr,
+          stride0,
+          stride1,
+          kSortingAlgorithmThreshold,
+          0,
+          nullptr,
+          offsetPtr);
+    }
+
+  } else {
+    CHECK_CUDA(outIndicesAux);
+    CHECK_CUDA(outLogitsAux);
+    const auto outIndicesAuxPtr = outIndicesAux.data_ptr<int32_t>();
+    const auto outLogitsAuxPtr = outLogitsAux.data_ptr<float>();
+    const auto rowStartsPtr = nullptr;
+    if (numColumns < kSortingAlgorithmThreshold) {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, false, false, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+          logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1, 0, 0, nullptr, offsetPtr);
+    } else if (numColumns < splitWorkThreshold) {
+      if (numRows >= 1024) {
+        constexpr int kNumThreadsPerBlock = 256;
+        topKPerRow<kNumThreadsPerBlock, true, false, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1, 0, 0, nullptr, offsetPtr);
+      } else {
+        constexpr int kNumThreadsPerBlock = 512;
+        topKPerRow<kNumThreadsPerBlock, true, false, false><<<numRows, kNumThreadsPerBlock, 0, stream>>>(
+            logitsPtr, rowStartsPtr, rowEndsPtr, outIndicesPtr, nullptr, stride0, stride1, 0, 0, nullptr, offsetPtr);
+      }
+    } else {
+      constexpr int kNumThreadsPerBlock = 512;
+      topKPerRow<kNumThreadsPerBlock, true, true, false>
+          <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock, 0, stream>>>(
+              logitsPtr,
+              rowStartsPtr,
+              rowEndsPtr,
+              outIndicesAuxPtr,
+              outLogitsAuxPtr,
+              stride0,
+              stride1,
+              0,
+              0,
+              nullptr,
+              offsetPtr);
+
+      constexpr int kNumThreadsPerBlockStep2 = 1024;
+      topKPerRow<kNumThreadsPerBlockStep2, true, false, true><<<numRows, kNumThreadsPerBlockStep2, 0, stream>>>(
+          outLogitsAuxPtr,
+          rowStartsPtr,
+          rowEndsPtr,
+          outIndicesPtr,
+          nullptr,
+          multipleBlocksPerRowConfig * kTopK,
+          1,
+          0,
+          multipleBlocksPerRowConfig,
+          outIndicesAuxPtr,
+          offsetPtr);
+    }
+  }
 
   const auto result = cudaGetLastError();
   TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
